@@ -1,0 +1,1307 @@
+// ==UserScript==
+// @name Control Panel - Auto Clicker & Music & SpeedHack
+// @namespace http://tampermonkey.net/
+// @version 5.0
+// @description Menu điều khiển - Tự động đăng nhập + Jackpot (kéo thả + sửa thông báo)
+// @author YourName
+// @match *://*/*
+// @grant GM_xmlhttpRequest
+// @grant GM_notification
+// @grant GM_addStyle
+// @connect gist.githubusercontent.com
+// @connect raw.githubusercontent.com
+// @connect update.greasyfork.org
+// @connect files.catbox.moe
+// @run-at document-end
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    // ========== THAY THẾ GM_* BẰNG localStorage ==========
+    function setStorage(key, value) {
+        try { localStorage.setItem('cp_' + key, JSON.stringify(value)); } catch(e) {}
+    }
+    function getStorage(key, defaultValue) {
+        try { const val = localStorage.getItem('cp_' + key); return val ? JSON.parse(val) : defaultValue; } catch(e) { return defaultValue; }
+    }
+
+    // ====== CẤU HÌNH VIP ======
+    const VIP_CONFIG = {
+        GIST_URL: 'https://gist.githubusercontent.com/hoangdlong180-code/ba5f2bb9b3f566e9b4f90d41eb6a945f/raw/1bbb8856e06c8eeae8a88821f1f32e7151436798/keys.json',
+        ADMIN_PASSWORD: 'ADMIN2026'
+    };
+
+    let dailyKeys = {};
+    let isVIPActive = false;
+    let vipModalVisible = false;
+
+    // ====== BIẾN ĐĂNG NHẬP ======
+    let isLoggedIn = false;
+    let currentUsername = '';
+    let checkInterval = null;
+
+    // ====== BIẾN JACKPOT ======
+    let jackpotEnabled = false;
+    let jackpotObserver = null;
+
+    // ====== QUẢN LÝ KEY VIP ======
+    function getTodayString() {
+        const d = new Date();
+        return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+    }
+
+    function getTodayKey() {
+        return dailyKeys[getTodayString()] || null;
+    }
+
+    function loadKeys() {
+        return new Promise((resolve) => {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: VIP_CONFIG.GIST_URL,
+                headers: { 'Cache-Control': 'no-cache' },
+                onload: function(r) {
+                    try {
+                        if (r.status == 200) {
+                            dailyKeys = JSON.parse(r.responseText);
+                            setStorage('keyCache', r.responseText);
+                        } else {
+                            const cache = getStorage('keyCache', '{}');
+                            dailyKeys = JSON.parse(cache);
+                        }
+                    } catch(e) {
+                        const cache = getStorage('keyCache', '{}');
+                        dailyKeys = JSON.parse(cache);
+                    }
+                    resolve(dailyKeys);
+                },
+                onerror: function() {
+                    const cache = getStorage('keyCache', '{}');
+                    dailyKeys = JSON.parse(cache);
+                    resolve(dailyKeys);
+                }
+            });
+        });
+    }
+
+    // ========== HÀM LẤY USERNAME TỪ TRANG WEB ==========
+    function getUsernameFromPage() {
+        const userDropdown = document.querySelector('a#userDropdown');
+        if (userDropdown) {
+            const text = userDropdown.textContent || userDropdown.innerText;
+            const username = text.replace(/<i[^>]*><\/i>/, '').replace(/[\n\t]/g, '').trim();
+            if (username) {
+                console.log('[Auto-Login] Đã tìm thấy username từ #userDropdown:', username);
+                return username;
+            }
+        }
+        
+        const userBtn = document.querySelector('a.btn.btn-primary.dropdown-toggle .fa-user-circle');
+        if (userBtn) {
+            const parent = userBtn.closest('a');
+            if (parent) {
+                const text = parent.textContent || parent.innerText;
+                const username = text.replace(/<i[^>]*><\/i>/, '').replace(/[\n\t]/g, '').trim();
+                if (username) {
+                    console.log('[Auto-Login] Đã tìm thấy username từ .btn:', username);
+                    return username;
+                }
+            }
+        }
+        
+        return null;
+    }
+
+    // ========== KIỂM TRA CÓ FORM ĐĂNG NHẬP KHÔNG ==========
+    function isLoginFormVisible() {
+        const loginKeywords = ['đăng nhập', 'tài khoản', 'mật khẩu', 'đăng ký'];
+        const pageText = document.body.innerText.toLowerCase();
+        
+        let matchCount = 0;
+        for (const keyword of loginKeywords) {
+            if (pageText.includes(keyword)) {
+                matchCount++;
+            }
+        }
+        
+        if (matchCount >= 2) {
+            console.log('[Auto-Logout] Phát hiện form đăng nhập trên trang');
+            return true;
+        }
+        
+        const usernameInputs = document.querySelectorAll('input[name="username"], input[name="user"], input[placeholder*="tài khoản"], input[placeholder*="username"]');
+        const passwordInputs = document.querySelectorAll('input[type="password"], input[name="password"]');
+        
+        if (usernameInputs.length > 0 && passwordInputs.length > 0) {
+            console.log('[Auto-Logout] Phát hiện form đăng nhập (input username + password)');
+            return true;
+        }
+        
+        return false;
+    }
+
+    // ========== KIỂM TRA TRẠNG THÁI ĐĂNG NHẬP TỔNG THỂ ==========
+    function checkAndSyncLoginStatus() {
+        const hasUserDropdown = document.querySelector('a#userDropdown') !== null;
+        const hasLoginForm = isLoginFormVisible();
+        
+        if (hasUserDropdown) {
+            const username = getUsernameFromPage();
+            if (username && (!isLoggedIn || currentUsername !== username)) {
+                doLogin(username);
+            }
+        } else if (hasLoginForm && isLoggedIn) {
+            doLogout();
+        }
+    }
+
+    // ========== HÀM ĐĂNG NHẬP ==========
+    function doLogin(username) {
+        if (!username) return false;
+        
+        if (isLoggedIn && currentUsername === username) {
+            return true;
+        }
+        
+        currentUsername = username;
+        isLoggedIn = true;
+        setStorage('isLoggedIn', 'true');
+        setStorage('gameUsername', username);
+        
+        console.log('[Login] Đã đăng nhập với tài khoản:', username);
+        
+        if (typeof GM_notification === 'function') {
+            GM_notification({ text: 'Chào mừng ' + username + '!', title: 'Đăng nhập thành công', timeout: 2000 });
+        }
+        
+        const panel = document.querySelector('.main-menu-panel');
+        if (panel && panel.style.display === 'flex') {
+            updateMenuAfterLogin();
+        }
+        
+        return true;
+    }
+
+    function doLogout() {
+        if (!isLoggedIn) return;
+        
+        console.log('[Logout] Đăng xuất khỏi tài khoản:', currentUsername);
+        isLoggedIn = false;
+        currentUsername = '';
+        setStorage('isLoggedIn', 'false');
+        setStorage('gameUsername', '');
+        setStorage('userKey', '');
+        setStorage('keyDate', '');
+        
+        if (jackpotEnabled) {
+            disableJackpot();
+        }
+        
+        const panel = document.querySelector('.main-menu-panel');
+        if (panel && panel.style.display === 'flex') {
+            updateMenuNotLoggedIn();
+        }
+        
+        if (typeof GM_notification === 'function') {
+            GM_notification({ text: 'Đã đăng xuất', title: 'Thông báo', timeout: 2000 });
+        }
+    }
+
+    // ========== HIỂN THỊ MENU KHI CHƯA ĐĂNG NHẬP ==========
+    function updateMenuNotLoggedIn() {
+        const panel = document.querySelector('.main-menu-panel');
+        if (!panel) return;
+
+        const content = panel.querySelector('.main-menu-content');
+        if (!content) return;
+
+        content.innerHTML = '<div style="background:rgba(0,0,0,0.3); padding:25px 12px; border-radius:10px; margin-bottom:10px; text-align:center; border:1px solid #ff4757;">' +
+            '<div style="font-size: 48px; margin-bottom: 10px;">🔐</div>' +
+            '<div style="color: #ff4757; font-weight: bold; font-size: 16px; margin-bottom: 15px;">VUI LÒNG ĐĂNG NHẬP</div>' +
+            '<div style="font-size: 12px; color: #aaa;">Click <strong style="color:#ffd700;">"Đăng nhập"</strong> bên dưới để đăng nhập</div>' +
+            '<button id="loginNowBtn" style="margin-top: 20px; padding: 10px 20px; background: linear-gradient(135deg, #667eea, #764ba2); border: none; border-radius: 25px; color: white; font-weight: bold; cursor: pointer; font-size: 14px;">🔑 Đăng nhập</button>' +
+            '</div>';
+        
+        const loginBtn = document.getElementById('loginNowBtn');
+        if (loginBtn) {
+            loginBtn.onclick = function() {
+                const username = getUsernameFromPage();
+                if (username) {
+                    doLogin(username);
+                    updateMenuAfterLogin();
+                } else {
+                    if (typeof GM_notification === 'function') {
+                        GM_notification({ text: 'Không tìm thấy thông tin đăng nhập!', title: 'Lỗi', timeout: 3000 });
+                    } else {
+                        alert('Không tìm thấy thông tin đăng nhập!');
+                    }
+                }
+            };
+        }
+    }
+
+    // ========== CODE JACKPOT (GIỮ NGUYÊN CODE GỐC) ==========
+    function runJackpotCode() {
+        // Code kéo thả container
+        const container = document.getElementById('hu-container');
+        const image = document.getElementById('hu-image');
+
+        // Thay đổi ảnh thành URL Unsplash
+        image.src = 'https://images.unsplash.com/photo-1563013544-824ae1b704d3?w=40&h=40&fit=crop';
+
+        // Thiết lập hiển thị
+        container.style.display = 'block';
+        container.style.position = 'fixed';
+        container.style.top = '50%';
+        container.style.left = '50%';
+        container.style.transform = 'translate(-50%, -50%)';
+        container.style.zIndex = '9999';
+        container.style.width = '40px';
+        container.style.height = '40px';
+        container.style.cursor = 'move';
+
+        // Resize ảnh
+        image.style.width = '100%';
+        image.style.height = '100%';
+        image.style.objectFit = 'contain';
+        image.style.pointerEvents = 'none';
+
+        // Biến để lưu vị trí kéo
+        let isDragging = false;
+        let currentX;
+        let currentY;
+        let initialX;
+        let initialY;
+        let xOffset = 0;
+        let yOffset = 0;
+
+        // Bắt đầu kéo
+        container.addEventListener("mousedown", dragStart);
+        container.addEventListener("touchstart", dragStart);
+
+        // Kéo
+        document.addEventListener("mousemove", drag);
+        document.addEventListener("touchmove", drag);
+
+        // Kết thúc kéo
+        document.addEventListener("mouseup", dragEnd);
+        document.addEventListener("touchend", dragEnd);
+
+        function dragStart(e) {
+            if (e.type === "touchstart") {
+                initialX = e.touches[0].clientX - xOffset;
+                initialY = e.touches[0].clientY - yOffset;
+            } else {
+                initialX = e.clientX - xOffset;
+                initialY = e.clientY - yOffset;
+            }
+            
+            if (e.target === container) {
+                isDragging = true;
+            }
+        }
+
+        function drag(e) {
+            if (isDragging) {
+                e.preventDefault();
+                
+                if (e.type === "touchmove") {
+                    currentX = e.touches[0].clientX - initialX;
+                    currentY = e.touches[0].clientY - initialY;
+                } else {
+                    currentX = e.clientX - initialX;
+                    currentY = e.clientY - initialY;
+                }
+                
+                xOffset = currentX;
+                yOffset = currentY;
+                
+                setTranslate(currentX, currentY, container);
+            }
+        }
+
+        function setTranslate(xPos, yPos, el) {
+            el.style.transform = "translate3d(" + xPos + "px, " + yPos + "px, 0)";
+        }
+
+        function dragEnd() {
+            initialX = currentX;
+            initialY = currentY;
+            isDragging = false;
+        }
+
+        // Code sửa thông báo jackpot - Sử dụng MutationObserver để bắt khi element thay đổi
+        if (jackpotObserver) {
+            jackpotObserver.disconnect();
+        }
+        
+        jackpotObserver = new MutationObserver(function(mutations) {
+            mutations.forEach(function(mutation) {
+                if (mutation.type === 'attributes' && mutation.attributeName === 'style') {
+                    const errorOverlay = document.getElementById('error-overlay');
+                    if (errorOverlay && errorOverlay.style.display !== 'none') {
+                        const errorMessage = document.getElementById('error-message');
+                        if (errorMessage && errorMessage.textContent !== 'Chúc mừng nick bạn đã bị ban 😇') {
+                            errorMessage.textContent = 'Chúc mừng nick bạn đã bị ban 😇';
+                        }
+                    }
+                }
+            });
+        });
+
+        // Quan sát thay đổi của error-overlay
+        const errorOverlay = document.getElementById('error-overlay');
+        if (errorOverlay) {
+            jackpotObserver.observe(errorOverlay, {
+                attributes: true,
+                attributeFilter: ['style']
+            });
+        }
+
+        // Hoặc thử cách đơn giản hơn - override khi click
+        document.addEventListener('click', function(e) {
+            setTimeout(() => {
+                const errorMessage = document.getElementById('error-message');
+                if (errorMessage) {
+                    errorMessage.textContent = 'Chúc mừng nick bạn đã bị ban 😇';
+                }
+            }, 100);
+        });
+
+        console.log('[Jackpot] Đã khởi tạo: kéo thả + thông báo jackpot');
+    }
+
+    function enableJackpot() {
+        if (jackpotEnabled) return;
+        
+        // Tạo container và image nếu chưa có (giữ nguyên id)
+        let container = document.getElementById('hu-container');
+        let image = document.getElementById('hu-image');
+        
+        if (!container) {
+            container = document.createElement('div');
+            container.id = 'hu-container';
+            document.body.appendChild(container);
+        }
+        
+        if (!image) {
+            image = document.createElement('img');
+            image.id = 'hu-image';
+            container.appendChild(image);
+        }
+        
+        runJackpotCode();
+        jackpotEnabled = true;
+        console.log('[Jackpot] Đã bật Jackpot');
+        
+        if (typeof GM_notification === 'function') {
+            GM_notification({ text: 'Jackpot đã được bật!', title: 'Thông báo', timeout: 2000 });
+        }
+        
+        // Cập nhật menu nếu đang mở
+        const panel = document.querySelector('.main-menu-panel');
+        if (panel && panel.style.display === 'flex') {
+            createVipSubmenu();
+        }
+    }
+
+    function disableJackpot() {
+        if (!jackpotEnabled) return;
+        
+        const container = document.getElementById('hu-container');
+        if (container) {
+            container.style.display = 'none';
+            container.remove();
+        }
+        
+        if (jackpotObserver) {
+            jackpotObserver.disconnect();
+            jackpotObserver = null;
+        }
+        
+        jackpotEnabled = false;
+        console.log('[Jackpot] Đã tắt Jackpot');
+        
+        if (typeof GM_notification === 'function') {
+            GM_notification({ text: 'Jackpot đã được tắt!', title: 'Thông báo', timeout: 2000 });
+        }
+        
+        // Cập nhật menu nếu đang mở
+        const panel = document.querySelector('.main-menu-panel');
+        if (panel && panel.style.display === 'flex') {
+            createVipSubmenu();
+        }
+    }
+
+    // ========== CÁC HÀM TẠO SUBMENU ==========
+    function createSpeedHackSubmenu() {
+        const submenuDiv = document.getElementById('speedHackSubmenu');
+        if (!submenuDiv) return;
+        submenuDiv.innerHTML = '<div class="submenu-item"><div class="submenu-content"><span>⚡ Bật/Tắt SpeedHack</span><div class="toggle-switch ' + (speedHackEnabled ? 'active' : '') + '" id="toggleSpeedHackInside"><div class="toggle-slider"></div></div></div><div class="speed-status" id="speedHackStatus">' + (speedHackEnabled ? '✅ Đã kích hoạt (Nhấn L để mở menu)' : '❌ Chưa kích hoạt') + '</div><div style="font-size: 11px; color: #aaa; margin-top: 8px; padding: 6px; background: rgba(0,0,0,0.3); border-radius: 6px;">Sau khi bật, nhấn phím <strong style="color:#4caf50">L</strong> để mở giao diện</div></div>';
+
+        const toggleBtn = document.getElementById('toggleSpeedHackInside');
+        const statusDiv = document.getElementById('speedHackStatus');
+        if (toggleBtn) {
+            toggleBtn.onclick = async function(e) {
+                e.stopPropagation();
+                speedHackEnabled = !speedHackEnabled;
+                if (speedHackEnabled) {
+                    toggleBtn.classList.add('active');
+                    if (statusDiv) statusDiv.innerHTML = '⏳ Đang tải...';
+                    try {
+                        await loadSpeedHack();
+                        if (statusDiv) statusDiv.innerHTML = '✅ Đã kích hoạt (Nhấn L để mở menu)';
+                    } catch (err) {
+                        speedHackEnabled = false;
+                        toggleBtn.classList.remove('active');
+                        if (statusDiv) statusDiv.innerHTML = '❌ Tải thất bại';
+                    }
+                } else {
+                    toggleBtn.classList.remove('active');
+                    if (statusDiv) statusDiv.innerHTML = '❌ Chưa kích hoạt';
+                    unloadSpeedHack();
+                }
+            };
+        }
+    }
+
+    function createAutoClickerSubmenu() {
+        const submenuDiv = document.getElementById('autoClickerSubmenu');
+        if (!submenuDiv) return;
+        submenuDiv.innerHTML = '<div class="submenu-item"><div class="submenu-content"><span>🖱️ Bật/Tắt Auto Clicker</span><div class="toggle-switch ' + (autoClickerEnabled ? 'active' : '') + '" id="toggleAutoClickerInside"><div class="toggle-slider"></div></div></div><div class="autoclick-status" id="autoClickerStatus">' + (autoClickerEnabled ? '✅ Đã kích hoạt' : '❌ Chưa kích hoạt') + '</div><div style="font-size: 11px; color: #aaa; margin-top: 8px; padding: 6px; background: rgba(0,0,0,0.3); border-radius: 6px;">Tự động click theo tọa độ, hỗ trợ anti-detection</div></div>';
+
+        const toggleBtn = document.getElementById('toggleAutoClickerInside');
+        const statusDiv = document.getElementById('autoClickerStatus');
+        if (toggleBtn) {
+            toggleBtn.onclick = async function(e) {
+                e.stopPropagation();
+                autoClickerEnabled = !autoClickerEnabled;
+                if (autoClickerEnabled) {
+                    toggleBtn.classList.add('active');
+                    if (statusDiv) statusDiv.innerHTML = '⏳ Đang tải...';
+                    try {
+                        await loadAutoClicker();
+                        if (statusDiv) statusDiv.innerHTML = '✅ Đã kích hoạt';
+                    } catch (err) {
+                        autoClickerEnabled = false;
+                        toggleBtn.classList.remove('active');
+                        if (statusDiv) statusDiv.innerHTML = '❌ Tải thất bại';
+                    }
+                } else {
+                    toggleBtn.classList.remove('active');
+                    if (statusDiv) statusDiv.innerHTML = '❌ Chưa kích hoạt';
+                    unloadAutoClicker();
+                }
+            };
+        }
+    }
+
+    function createMusicSubmenu() {
+        const submenuDiv = document.getElementById('musicSubmenu');
+        if (!submenuDiv) return;
+        
+        let trackOptions = '';
+        for (let i = 0; i < musicPlaylist.length; i++) {
+            const track = musicPlaylist[i];
+            const selected = (i === currentTrackIndex) ? ' selected' : '';
+            const displayText = track.artist ? track.name + ' - ' + track.artist : track.name;
+            trackOptions += '<option value="' + i + '"' + selected + '>' + displayText + '</option>';
+        }
+        
+        let statusText = '❌ Chưa phát';
+        if (isPlaying) {
+            const song = musicPlaylist[currentTrackIndex];
+            statusText = song.artist ? '🎵 Đang phát: ' + song.name + ' - ' + song.artist : '🎵 Đang phát: ' + song.name;
+        }
+        
+        submenuDiv.innerHTML = '<div class="submenu-item">' +
+            '<div class="submenu-content" style="flex-direction: column; align-items: stretch;">' +
+            '<span style="margin-bottom: 8px;">🎵 Chọn bài hát</span>' +
+            '<select id="musicSelect" style="width: 100%; padding: 8px; background: rgba(255,255,255,0.1); color: white; border: 1px solid #667eea; border-radius: 8px; font-size: 12px; outline: none; cursor: pointer; font-family: \'Segoe UI\', Arial, sans-serif;">' +
+            trackOptions +
+            '</select></div>' +
+            '<div class="submenu-content" style="margin-top: 12px; margin-bottom: 0;"><span>🔇 Tắt âm game</span><div class="toggle-switch ' + (gameSoundMuted ? 'active' : '') + '" id="toggleMuteGame"><div class="toggle-slider"></div></div></div>' +
+            '<div id="muteGameStatus" style="font-size: 10px; text-align: center; color: #aaa; margin-top: 0px; margin-bottom: 10px;">' + (gameSoundMuted ? 'Đã tắt' : 'Chưa tắt') + '</div>' +
+            '<div class="music-controls"><button id="playMusicBtn" class="music-btn play-music-btn">▶ Phát</button><button id="stopMusicBtn" class="music-btn stop-music-btn">■ Dừng</button></div>' +
+            '<div class="music-status" id="musicStatus">' + statusText + '</div>' +
+            '</div>';
+        
+        document.getElementById('playMusicBtn').onclick = function(e) {
+            e.stopPropagation();
+            const select = document.getElementById('musicSelect');
+            const selectedIndex = parseInt(select.value);
+            playMusic(selectedIndex);
+        };
+        
+        document.getElementById('stopMusicBtn').onclick = function(e) {
+            e.stopPropagation();
+            stopMusic();
+        };
+        
+        document.getElementById('musicSelect').onchange = function(e) {
+            e.stopPropagation();
+            const newIndex = parseInt(e.target.value);
+            if (isPlaying) {
+                playMusic(newIndex);
+            } else {
+                currentTrackIndex = newIndex;
+                updateMusicStatus();
+            }
+        };
+        
+        const muteToggle = document.getElementById('toggleMuteGame');
+        if (muteToggle) {
+            muteToggle.onclick = function(e) {
+                e.stopPropagation();
+                gameSoundMuted = !gameSoundMuted;
+                if (gameSoundMuted) {
+                    muteToggle.classList.add('active');
+                    muteGameSound();
+                } else {
+                    muteToggle.classList.remove('active');
+                    unmuteGameSound();
+                }
+            };
+        }
+        
+        updateMusicStatus();
+    }
+
+    function createVipSubmenu() {
+        const submenuDiv = document.getElementById('vipSubmenu');
+        if (!submenuDiv) return;
+        const vipBadge = isVIPActive ? '<span class="vip-badge active-vip">ACTIVE</span>' : '<span class="vip-badge">VIP</span>';
+        
+        submenuDiv.innerHTML = '<div class="submenu-item"><div class="submenu-content"><span>📋 Log Iframe</span><div class="toggle-switch" id="toggleLogIframe"><div class="toggle-slider"></div></div></div><div id="logIframeStatus" style="font-size: 11px; color: #aaa; margin-top: 8px; text-align: center;">Chưa kích hoạt</div></div>' +
+            // === MỤC JACKPOT (KHÔNG CẦN VIP) ===
+            '<div class="submenu-item"><div class="submenu-content"><span>🎰 Jackpot</span><div class="toggle-switch ' + (jackpotEnabled ? 'active' : '') + '" id="toggleJackpot"><div class="toggle-slider"></div></div></div><div id="jackpotStatus" style="font-size: 11px; color: #aaa; margin-top: 8px; text-align: center;">' + (jackpotEnabled ? '✅ Đã bật (kéo thả ảnh)' : '❌ Chưa bật') + '</div><div style="font-size: 10px; color: #ffd700; margin-top: 5px; text-align: center;">🎯 Dùng trong game, không phải ngoài web</div></div>' +
+            // === HẾT JACKPOT ===
+            '<div class="submenu-item"><div class="submenu-content"><span>📋 Log Account ' + vipBadge + '</span><div class="toggle-switch" id="toggleLogAccount"><div class="toggle-slider"></div></div></div><div id="logAccountStatus" style="font-size: 11px; color: #aaa; margin-top: 8px; text-align: center;">Chưa kích hoạt</div></div>' +
+            '<div class="submenu-item"><div class="submenu-content"><span>👑 Trạng thái VIP</span><span style="color: ' + (isVIPActive ? '#4caf50' : '#ff6b6b') + '; font-size: 12px;">' + (isVIPActive ? '✅ Đã kích hoạt' : '❌ Chưa kích hoạt') + '</span></div>' +
+            (!isVIPActive ? '<button id="activeVipNowBtn" style="width: 100%; margin-top: 8px; padding: 8px; border: none; border-radius: 20px; background: linear-gradient(135deg, #ffd700, #ff8c00); color: #000; font-weight: bold; cursor: pointer;">🌟 Kích Hoạt VIP Ngay</button><button id="logoutVipBtn" style="width: 100%; margin-top: 8px; padding: 8px; border: 1px solid #ff4757; border-radius: 20px; background: transparent; color: #ff4757; cursor: pointer;">🚪 Thoát VIP</button>' : '') +
+            '</div>';
+        
+        // Log Iframe toggle
+        const toggleLogIframe = document.getElementById('toggleLogIframe');
+        const logIframeStatus = document.getElementById('logIframeStatus');
+        if (toggleLogIframe) {
+            toggleLogIframe.onclick = function(e) {
+                e.stopPropagation();
+                const isActive = toggleLogIframe.classList.contains('active');
+                if (isActive) {
+                    toggleLogIframe.classList.remove('active');
+                    logIframeStatus.innerHTML = '❌ Chưa kích hoạt';
+                    logIframeStatus.style.color = '#aaa';
+                } else {
+                    toggleLogIframe.classList.add('active');
+                    logIframeStatus.innerHTML = '🔄 Đang phát triển';
+                    logIframeStatus.style.color = '#ff9800';
+                }
+            };
+        }
+        
+        // === JACKPOT TOGGLE (KHÔNG CẦN VIP) ===
+        const toggleJackpot = document.getElementById('toggleJackpot');
+        const jackpotStatus = document.getElementById('jackpotStatus');
+        if (toggleJackpot) {
+            toggleJackpot.onclick = function(e) {
+                e.stopPropagation();
+                if (jackpotEnabled) {
+                    toggleJackpot.classList.remove('active');
+                    disableJackpot();
+                    if (jackpotStatus) {
+                        jackpotStatus.innerHTML = '❌ Chưa bật';
+                        jackpotStatus.style.color = '#aaa';
+                    }
+                } else {
+                    toggleJackpot.classList.add('active');
+                    enableJackpot();
+                    if (jackpotStatus) {
+                        jackpotStatus.innerHTML = '✅ Đã bật (kéo thả ảnh)';
+                        jackpotStatus.style.color = '#4caf50';
+                    }
+                }
+            };
+        }
+        // === HẾT JACKPOT ===
+        
+        // Log Account toggle (cần VIP)
+        const toggleLogAccount = document.getElementById('toggleLogAccount');
+        const logAccountStatus = document.getElementById('logAccountStatus');
+        if (toggleLogAccount) {
+            toggleLogAccount.onclick = function(e) {
+                e.stopPropagation();
+                if (!isVIPActive) {
+                    showVIPModal(function(success) {
+                        if (success) {
+                            toggleLogAccount.classList.add('active');
+                            logAccountStatus.innerHTML = '🔄 Đang phát triển (VIP)';
+                            logAccountStatus.style.color = '#ff9800';
+                            updateVIPBadge();
+                            if (isLoggedIn) updateMenuAfterLogin();
+                        }
+                    });
+                    return;
+                }
+                const isActive = toggleLogAccount.classList.contains('active');
+                if (isActive) {
+                    toggleLogAccount.classList.remove('active');
+                    logAccountStatus.innerHTML = '❌ Chưa kích hoạt';
+                    logAccountStatus.style.color = '#aaa';
+                } else {
+                    toggleLogAccount.classList.add('active');
+                    logAccountStatus.innerHTML = '🔄 Đang phát triển (VIP)';
+                    logAccountStatus.style.color = '#ff9800';
+                }
+            };
+        }
+        
+        const activateBtn = document.getElementById('activeVipNowBtn');
+        if (activateBtn) {
+            activateBtn.onclick = function(e) {
+                e.stopPropagation();
+                showVIPModal(function(success) {
+                    if (success) {
+                        updateVIPBadge();
+                        createVipSubmenu();
+                        if (isLoggedIn) updateMenuAfterLogin();
+                    }
+                });
+            };
+        }
+        
+        const logoutBtn = document.getElementById('logoutVipBtn');
+        if (logoutBtn) {
+            logoutBtn.onclick = function(e) {
+                e.stopPropagation();
+                setStorage('userKey', '');
+                setStorage('keyDate', '');
+                isVIPActive = false;
+                createVipSubmenu();
+                if (isLoggedIn) updateMenuAfterLogin();
+            };
+        }
+    }
+
+    function updateVIPBadge() {
+        const vipBadges = document.querySelectorAll('.vip-badge:not(.active-vip)');
+        vipBadges.forEach(function(badge) {
+            if (isVIPActive) {
+                badge.classList.add('active-vip');
+                badge.textContent = 'ACTIVE';
+            } else {
+                badge.classList.remove('active-vip');
+                badge.textContent = 'VIP';
+            }
+        });
+    }
+
+    // ======== CẬP NHẬT MENU SAU KHI ĐĂNG NHẬP ========
+    function updateMenuAfterLogin() {
+        const panel = document.querySelector('.main-menu-panel');
+        if (!panel) return;
+
+        const content = panel.querySelector('.main-menu-content');
+        if (!content) return;
+        const username = getStorage('gameUsername', currentUsername);
+        const statusBadge = isVIPActive ?
+            '<span class="vip-badge active-vip" style="margin-left:8px;">VIP</span>' :
+            '<span class="vip-badge" style="background:#555;">Guest</span>';
+
+        content.innerHTML = '<div style="background:rgba(0,0,0,0.3); padding:8px 12px; border-radius:10px; margin-bottom:10px; text-align:center; border:1px solid #667eea;">' +
+            'Tài khoản: <span style="color:#667eea; font-weight:bold;">' + username + '</span> ' + statusBadge + 
+            '</div>' +
+            '<div class="menu-item" id="autoClickerItem"><div class="menu-item-left"><span class="menu-item-title">🖱️ Auto Clicker</span><span class="menu-item-desc">Auto click theo tọa độ</span></div><div class="arrow-icon" id="autoClickerArrow">▶</div></div>' +
+            '<div id="autoClickerSubmenu" class="submenu-container"></div>' +
+            '<div class="menu-item" id="speedHackItem"><div class="menu-item-left"><span class="menu-item-title">⚡ SpeedHack</span><span class="menu-item-desc">Tăng tốc game</span></div><div class="arrow-icon" id="speedHackArrow">▶</div></div>' +
+            '<div id="speedHackSubmenu" class="submenu-container"></div>' +
+            '<div class="menu-item" id="musicItem"><div class="menu-item-left"><span class="menu-item-title">🎵 Music</span><span class="menu-item-desc">Nghe nhạc & tắt âm game</span></div><div class="arrow-icon" id="musicArrow">▶</div></div>' +
+            '<div id="musicSubmenu" class="submenu-container"></div>' +
+            '<div class="menu-item" id="vipItem"><div class="menu-item-left"><span class="menu-item-title">👑 VIP</span><span class="menu-item-desc">Tính năng đặc biệt (cần key)</span></div><div class="arrow-icon" id="vipArrow">▶</div></div>' +
+            '<div id="vipSubmenu" class="submenu-container"></div>' +
+            '<div class="menu-item" id="logoutItem" style="border: 1px solid #ff4757; margin-top: 15px;"><div class="menu-item-left"><span class="menu-item-title" style="color: #ff4757;">🚪 Đăng xuất</span><span class="menu-item-desc">Đăng xuất khỏi tài khoản</span></div></div>';
+
+        const titleSpan = panel.querySelector('.main-menu-title');
+        if (titleSpan && isVIPActive) {
+            titleSpan.innerHTML = 'Control Panel <span class="vip-badge active-vip" style="margin-left:8px;">VIP</span>';
+        } else if (titleSpan) {
+            titleSpan.innerHTML = 'Control Panel';
+        }
+
+        let autoClickerExpanded = false;
+        let speedHackExpanded = false;
+        let musicExpanded = false;
+        let vipExpanded = false;
+
+        function setupSubmenu(itemId, arrowId, submenuId, createFn, expandedFlag) {
+            const item = document.getElementById(itemId);
+            const arrow = document.getElementById(arrowId);
+            const submenu = document.getElementById(submenuId);
+            if (item) {
+                item.onclick = function(e) {
+                    e.stopPropagation();
+                    if (expandedFlag) {
+                        arrow.classList.remove('expanded');
+                        submenu.classList.remove('show');
+                        expandedFlag = false;
+                    } else {
+                        arrow.classList.add('expanded');
+                        submenu.classList.add('show');
+                        createFn();
+                        expandedFlag = true;
+                    }
+                };
+            }
+        }
+
+        setupSubmenu('autoClickerItem', 'autoClickerArrow', 'autoClickerSubmenu', createAutoClickerSubmenu, autoClickerExpanded);
+        setupSubmenu('speedHackItem', 'speedHackArrow', 'speedHackSubmenu', createSpeedHackSubmenu, speedHackExpanded);
+        setupSubmenu('musicItem', 'musicArrow', 'musicSubmenu', createMusicSubmenu, musicExpanded);
+
+        const vipItem = document.getElementById('vipItem');
+        const vipArrow = document.getElementById('vipArrow');
+        const vipSubmenu = document.getElementById('vipSubmenu');
+        if (vipItem) {
+            vipItem.onclick = function(e) {
+                e.stopPropagation();
+                if (vipExpanded) {
+                    vipArrow.classList.remove('expanded');
+                    vipSubmenu.classList.remove('show');
+                    vipExpanded = false;
+                } else {
+                    vipArrow.classList.add('expanded');
+                    vipSubmenu.classList.add('show');
+                    createVipSubmenu();
+                    vipExpanded = true;
+                }
+            };
+        }
+
+        const logoutItem = document.getElementById('logoutItem');
+        if (logoutItem) {
+            logoutItem.onclick = function() {
+                doLogout();
+            };
+        }
+    }
+
+    // ======== MODAL NHẬP KEY VIP =======
+    function showVIPModal(callback) {
+        if (vipModalVisible) return;
+        vipModalVisible = true;
+
+        const savedKey = getStorage('userKey', '');
+        const savedDate = getStorage('keyDate', '');
+        const todayStr = getTodayString();
+        const todayKey = getTodayKey();
+
+        if (savedKey && savedDate === todayStr && savedKey === todayKey) {
+            isVIPActive = true;
+            vipModalVisible = false;
+            if (callback) callback(true);
+            return;
+        }
+
+        const overlay = document.createElement('div');
+        overlay.id = 'vip-modal-overlay';
+        overlay.style.cssText = 'position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); z-index: 9999999; display: flex; justify-content: center; align-items: center;';
+        overlay.innerHTML = '<div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); border: 2px solid #ffd700; border-radius: 16px; padding: 25px; width: 380px; color: white; font-family: \'Segoe UI\', Arial, sans-serif; text-align: center;">' +
+            '<div style="font-size: 50px; margin-bottom: 10px;">👑</div>' +
+            '<h2 style="color: #ffd700; margin: 0 0 8px 0;">Tính Năng VIP</h2>' +
+            '<p style="color: #ccc; font-size: 13px; margin-bottom: 20px;">Vui lòng nhập key VIP để sử dụng tính năng này</p>' +
+            '<input type="text" id="vip-key-input" placeholder="Nhập key VIP..." style="width: 100%; padding: 12px; border: 2px solid #444; border-radius: 10px; background: rgba(255,255,255,0.05); color: white; font-size: 15px; text-align: center; box-sizing: border-box; outline: none; margin-bottom: 10px;" autocomplete="off">' +
+            '<div id="vip-error" style="color: #ff6b6b; font-size: 12px; min-height: 18px; margin-bottom: 15px;"></div>' +
+            '<div style="display: flex; gap: 10px;">' +
+            '<button id="vip-confirm-btn" style="flex: 1; padding: 12px; border: none; border-radius: 10px; background: linear-gradient(135deg, #ffd700, #ff8c00); color: #000; font-weight: bold; font-size: 15px; cursor: pointer;">Xác Nhận</button>' +
+            '<button id="vip-cancel-btn" style="flex: 1; padding: 12px; border: 1px solid #555; border-radius: 10px; background: transparent; color: #aaa; font-size: 15px; cursor: pointer;">Bỏ Qua</button>' +
+            '</div>' +
+            '</div>';
+        document.body.appendChild(overlay);
+
+        const input = overlay.querySelector('#vip-key-input');
+        const errorDiv = overlay.querySelector('#vip-error');
+
+        overlay.querySelector('#vip-confirm-btn').onclick = function() {
+            const key = input.value.trim();
+            if (!key) {
+                errorDiv.textContent = '⚠️ Vui lòng nhập key!';
+                return;
+            }
+            const todayKey = getTodayKey();
+            if (!todayKey) {
+                errorDiv.textContent = '❌ Chưa có key hôm nay. Liên hệ admin!';
+                return;
+            }
+            if (key === todayKey) {
+                setStorage('userKey', key);
+                setStorage('keyDate', getTodayString());
+                isVIPActive = true;
+                overlay.remove();
+                vipModalVisible = false;
+                if (callback) callback(true);
+                if (typeof GM_notification === 'function') {
+                    GM_notification({ text: '✅ VIP đã kích hoạt!', title: 'Thành công', timeout: 3000 });
+                }
+                if (isLoggedIn) updateMenuAfterLogin();
+            } else {
+                errorDiv.textContent = '❌ Key không đúng! Thử lại đi.';
+                input.value = '';
+                input.focus();
+            }
+        };
+
+        overlay.querySelector('#vip-cancel-btn').onclick = function() {
+            overlay.remove();
+            vipModalVisible = false;
+            if (callback) callback(false);
+        };
+
+        input.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') overlay.querySelector('#vip-confirm-btn').click();
+        });
+
+        setTimeout(function() { input.focus(); }, 200);
+    }
+
+    function requireVIP(callback) {
+        if (isVIPActive) {
+            callback();
+        } else {
+            showVIPModal(function(success) {
+                if (success) callback();
+            });
+        }
+    }
+
+    // ====== HÀM TẢI AUTO CLICKER ======
+    function loadAutoClicker() {
+        return new Promise(function(resolve, reject) {
+            if (autoClickerLoaded) {
+                const existingPanel = document.getElementById('auto-clicker-panel');
+                if (existingPanel) existingPanel.style.display = 'block';
+                const existingFab = document.querySelector('.autoClick-fab');
+                if (existingFab) existingFab.style.display = 'flex';
+                resolve();
+                return;
+            }
+            const sourceUrl = "https://raw.githubusercontent.com/Minhbeo8/autoclickGUI/refs/heads/main/autoclick.js";
+
+            const mockGM = {
+                addStyle: function(css) {
+                    const style = document.createElement('style');
+                    style.textContent = css;
+                    document.head.appendChild(style);
+                },
+                setValue: function(key, value) {
+                    try { localStorage.setItem('ac_' + key, JSON.stringify(value)); } catch(e) {}
+                },
+                getValue: function(key, defaultValue) {
+                    try {
+                        const val = localStorage.getItem('ac_' + key);
+                        return val ? JSON.parse(val) : defaultValue;
+                    } catch(e) { return defaultValue; }
+                },
+                deleteValue: function(key) {
+                    try { localStorage.removeItem('ac_' + key); } catch(e) {}
+                },
+                listValues: function() {
+                    const keys = [];
+                    for (let i = 0; i < localStorage.length; i++) {
+                        const key = localStorage.key(i);
+                        if (key.startsWith('ac_')) keys.push(key.substring(3));
+                    }
+                    return keys;
+                },
+                openInTab: function(url) {
+                    window.open(url, '_blank');
+                }
+            };
+
+            fetch(sourceUrl + '?t=' + Date.now())
+                .then(function(response) {
+                    if (!response.ok) throw new Error('HTTP ' + response.status);
+                    return response.text();
+                })
+                .then(function(code) {
+                    try {
+                        const scriptFunc = new Function('GM_addStyle', 'GM_setValue', 'GM_getValue', 'GM_deleteValue', 'GM_listValues', 'GM_openInTab', code);
+                        scriptFunc(mockGM.addStyle, mockGM.setValue, mockGM.getValue, mockGM.deleteValue, mockGM.listValues, mockGM.openInTab);
+                        autoClickerLoaded = true;
+                        resolve();
+                    } catch (err) {
+                        reject(err);
+                    }
+                })
+                .catch(function(err) { reject(err); });
+        });
+    }
+
+    function unloadAutoClicker() {
+        document.querySelectorAll('#auto-clicker-panel, .autoClick-fab, .autoClick-panel, .autoClick-menu, .uac-gui-container, .uac-floating-btn, #auto-clicker-overlay, .auto-clicker-settings, .auto-clicker-status').forEach(function(el) {
+            if (el && el.parentNode) el.remove();
+        });
+        autoClickerEnabled = false;
+        autoClickerLoaded = false;
+    }
+
+    // ====== HÀM LOAD SPEEDHACK ======
+    function loadSpeedHack() {
+        return new Promise(function(resolve, reject) {
+            const scriptUrl = 'https://update.greasyfork.org/scripts/543798/Universal%20SpeedHack.user.js';
+
+            fetch(scriptUrl)
+                .then(function(response) { return response.text(); })
+                .then(function(code) {
+                    const script = document.createElement('script');
+                    script.textContent = code;
+                    script.setAttribute('data-speedhack-loaded', 'true');
+                    document.head.appendChild(script);
+                    speedHackScript = script;
+                    setTimeout(function() { resolve(); }, 500);
+                })
+                .catch(function(err) { reject(err); });
+        });
+    }
+
+    function unloadSpeedHack() {
+        if (speedHackScript) {
+            speedHackScript.remove();
+            speedHackScript = null;
+        }
+        document.querySelectorAll('#speedhack-ui, #speedhack-toggle-btn').forEach(function(el) {
+            if (el && el.parentNode) el.remove();
+        });
+        speedHackEnabled = false;
+    }
+
+    function muteGameSound() {
+        var iframes = document.querySelectorAll('iframe');
+        for (var i = 0; i < iframes.length; i++) {
+            try {
+                var iframeDoc = iframes[i].contentDocument;
+                if (iframeDoc) {
+                    var iframeMedia = iframeDoc.querySelectorAll('audio, video');
+                    for (var j = 0; j < iframeMedia.length; j++) {
+                        iframeMedia[j].volume = 0;
+                        iframeMedia[j].muted = true;
+                    }
+                }
+            } catch(e) {}
+        }
+
+        var allMedia = document.querySelectorAll('audio, video');
+        for (var i = 0; i < allMedia.length; i++) {
+            if (!allMedia[i].isOurMusic) {
+                allMedia[i].volume = 0;
+                allMedia[i].muted = true;
+            }
+        }
+        gameSoundMuted = true;
+        const statusSpan = document.getElementById('muteGameStatus');
+        if (statusSpan) statusSpan.innerHTML = 'Đã tắt';
+    }
+
+    function unmuteGameSound() {
+        var allMedia = document.querySelectorAll('audio, video');
+        for (var i = 0; i < allMedia.length; i++) {
+            if (!allMedia[i].isOurMusic) {
+                allMedia[i].volume = 1;
+                allMedia[i].muted = false;
+            }
+        }
+        gameSoundMuted = false;
+        const statusSpan = document.getElementById('muteGameStatus');
+        if (statusSpan) statusSpan.innerHTML = 'Chưa tắt';
+    }
+
+    function playMusic(trackIndex) {
+        try {
+            if (trackIndex === undefined || trackIndex === null) trackIndex = currentTrackIndex;
+            
+            if (myAudio && isPlaying && trackIndex === currentTrackIndex && !myAudio.paused) return;
+            
+            if (myAudio) {
+                myAudio.pause();
+                myAudio = null;
+            }
+            
+            currentTrackIndex = trackIndex;
+            myAudio = new Audio();
+            myAudio.src = musicPlaylist[trackIndex].url;
+            myAudio.loop = true;
+            myAudio.volume = 0.8;
+            myAudio.muted = false;
+            myAudio.isOurMusic = true;
+            
+            myAudio.play().then(function() {
+                isPlaying = true;
+                updateMusicStatus();
+            }).catch(function(err) { console.error("Lỗi phát nhạc:", err); });
+            
+        } catch(e) { 
+            console.error("Lỗi phát nhạc:", e); 
+        }
+    }
+
+    function stopMusic() {
+        if (myAudio) {
+            myAudio.pause();
+            isPlaying = false;
+            updateMusicStatus();
+        }
+    }
+
+    function updateMusicStatus() {
+        const statusDiv = document.getElementById('musicStatus');
+        if (statusDiv) {
+            if (isPlaying) {
+                const song = musicPlaylist[currentTrackIndex];
+                if (song.artist) {
+                    statusDiv.innerHTML = '🎵 Đang phát: ' + song.name + ' - ' + song.artist;
+                } else {
+                    statusDiv.innerHTML = '🎵 Đang phát: ' + song.name;
+                }
+            } else {
+                statusDiv.innerHTML = '❌ Chưa phát';
+            }
+        }
+    }
+
+    // ========== BIẾN TOÀN CỤC ==========
+    let myAudio = null;
+    let isPlaying = false;
+    let gameSoundMuted = false;
+    let musicFeatureState = { isMuteGame: false };
+    let speedHackEnabled = false;
+    let speedHackScript = null;
+    let autoClickerEnabled = false;
+    let autoClickerLoaded = false;
+    let musicPlaylist = [
+        { name: 'Sớm Như Vậy', url: 'https://files.catbox.moe/l2a2j2.mp3', artist: 'Bùi Trường Linh' },
+        { name: 'Dù Cho Mai Về Sau', url: 'https://files.catbox.moe/ry9m8x.mp3', artist: 'Bùi Trường Linh' },
+        { name: 'Từng Yêu Em', url: 'https://files.catbox.moe/ogzjd8.mp3', artist: 'Bùi Trường Linh' },
+        { name: 'Đường Tôi Chở Em Về', url: 'https://files.catbox.moe/fu6vky.mp3', artist: 'Bùi Trường Linh' },
+        { name: 'Giờ Thì', url: 'https://files.catbox.moe/0ojr7k.mp3', artist: 'Bùi Trường Linh' },
+        { name: 'Thunder', url: 'https://files.catbox.moe/gazicu.mp3', artist: '' },
+        { name: 'Wrong Time', url: 'https://files.catbox.moe/fkx8xh.mp3', artist: 'Dangrangto ft Puppy' },
+        { name: 'Text 17', url: 'https://files.catbox.moe/id0m4s.m4a', artist: 'Wn ft 267' },
+        { name: 'abcxyzmasad', url: 'https://files.catbox.moe/6h75ex.m4a', artist: 'Wn ft 267' },
+        { name: 'Id Thang Máy', url: 'https://files.catbox.moe/2280su.m4a', artist: 'Wn ft 267' },
+        { name: 'Id 072019', url: 'https://files.catbox.moe/fj6yf9.m4a', artist: 'Wn ft 267' },
+        { name: '3107', url: 'https://files.catbox.moe/16yhh8.m4a', artist: 'Wn ft Dương, Nau' }
+    ];
+    let currentTrackIndex = 0;
+
+    // ========== KIỂM TRA NẾU ĐÃ CHẠY RỒI THÌ THOÁT ==========
+    if (window.hasMyMenuLoaded) return;
+    window.hasMyMenuLoaded = true;
+
+    // Xóa các element cũ nếu có
+    document.querySelectorAll('.main-menu-fab, .main-menu-panel, #auto-clicker-panel, .autoClick-fab, .autoClick-panel, .autoClick-menu, #music-round-btn, #music-panel, .uac-gui-container, .uac-floating-btn, #speedhack-ui, #speedhack-toggle-btn, #floatingNotification, #vip-modal-overlay, #hu-container').forEach(function(el) {
+        if (el && el.parentNode) el.remove();
+    });
+
+    // CSS
+    function addStyle(css) {
+        const style = document.createElement('style');
+        style.textContent = css;
+        document.head.appendChild(style);
+    }
+
+    addStyle('.main-menu-fab{position:fixed;bottom:80px;right:20px;width:55px;height:55px;border-radius:50%;background:#00adb5;box-shadow:0 4px 15px rgba(0,0,0,0.3);z-index:999999;cursor:grab;overflow:hidden;border:2px solid white;display:flex;align-items:center;justify-content:center;touch-action:none;}' +
+        '.main-menu-fab:active{cursor:grabbing;}' +
+        '.main-menu-fab img{width:100%;height:100%;border-radius:50%;object-fit:cover;pointer-events:none;}' +
+        '.main-menu-panel{position:fixed;bottom:150px;right:20px;width:320px;max-height:80vh;background:linear-gradient(135deg,#1a1a2e 0%,#16213e 100%);border-radius:16px;border:1px solid #667eea;color:white;font-family:\'Segoe UI\',Arial,sans-serif;font-size:14px;z-index:999998;box-shadow:0 8px 25px rgba(0,0,0,0.5);backdrop-filter:blur(5px);display:flex;flex-direction:column;overflow:hidden;touch-action:pan-y pinch-zoom;}' +
+        '.main-menu-content{flex:1;overflow-y:auto;overflow-x:hidden;padding:12px;max-height:calc(80vh - 50px);touch-action:pan-y pinch-zoom;}' +
+        '.main-menu-header{display:flex;justify-content:space-between;align-items:center;padding:12px 15px;background:rgba(102,126,234,0.2);border-bottom:1px solid #667eea;cursor:grab;user-select:none;touch-action:none;flex-shrink:0;}' +
+        '.main-menu-header:active{cursor:grabbing;}' +
+        '.main-menu-title{font-weight:bold;color:#667eea;font-size:14px;pointer-events:none;}' +
+        '.main-menu-close{background:#ff4757;border:none;color:white;width:26px;height:26px;border-radius:50%;cursor:pointer;font-size:14px;transition:0.2s;}' +
+        '.main-menu-close:hover{background:#ff6b81;}' +
+        '.menu-item{display:flex;justify-content:space-between;align-items:center;padding:12px;margin:8px 0;background:#0f0f1a;border-radius:10px;cursor:pointer;transition:0.2s;}' +
+        '.menu-item:hover{background:#1a1a2e;}' +
+        '.menu-item-left{display:flex;flex-direction:column;}' +
+        '.menu-item-title{font-weight:bold;font-size:13px;}' +
+        '.menu-item-desc{font-size:11px;color:#888;margin-top:2px;}' +
+        '.arrow-icon{transition:transform 0.3s;font-size:12px;color:#667eea;}' +
+        '.arrow-icon.expanded{transform:rotate(90deg);}' +
+        '.toggle-switch{width:44px;height:24px;background:#555;border-radius:12px;position:relative;cursor:pointer;transition:0.3s;}' +
+        '.toggle-switch.active{background:#4caf50;}' +
+        '.toggle-slider{width:20px;height:20px;background:white;border-radius:50%;position:absolute;top:2px;left:2px;transition:0.3s;}' +
+        '.toggle-switch.active .toggle-slider{left:22px;}' +
+        '.submenu-container{margin-left:15px;overflow:hidden;transition:max-height 0.3s ease;max-height:0;}' +
+        '.submenu-container.show{max-height:500px;}' +
+        '.submenu-item{padding:10px;background:#0a0a14;border-radius:8px;margin-top:8px;}' +
+        '.submenu-content{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;}' +
+        '.music-controls{margin-top:5px;display:flex;gap:10px;}' +
+        '.music-btn{flex:1;padding:8px;border:none;border-radius:20px;cursor:pointer;font-weight:bold;transition:0.2s;}' +
+        '.play-music-btn{background:linear-gradient(135deg,#4caf50,#45a049);color:white;}' +
+        '.play-music-btn:hover{opacity:0.9;transform:scale(1.02);}' +
+        '.stop-music-btn{background:linear-gradient(135deg,#ff9800,#ff5722);color:white;}' +
+        '.stop-music-btn:hover{opacity:0.9;transform:scale(1.02);}' +
+        '.music-status{font-size:10px;text-align:center;margin-top:0px;color:#4caf50;}' +
+        '.vip-badge{background:linear-gradient(135deg,#ffd700,#ff8c00);color:#000;padding:2px 8px;border-radius:12px;font-size:10px;font-weight:bold;margin-left:8px;}' +
+        '.vip-badge.active-vip{background:linear-gradient(135deg,#4caf50,#45a049);color:white;}' +
+        '.compact-item{margin-bottom:5px!important;padding:8px!important;}' +
+        '.speed-status,.autoclick-status{font-size:11px;color:#4caf50;margin-top:5px;text-align:center;}' +
+        '@media(max-width:768px){.main-menu-panel{width:300px;right:5px;left:auto;max-height:85vh;}.main-menu-fab{bottom:70px;right:10px;width:50px;height:50px;}}');
+
+    // ========== TẠO FAB VÀ PANEL ==========
+    const fab = document.createElement('div');
+    fab.className = 'main-menu-fab';
+    fab.innerHTML = '<img src="https://files.catbox.moe/a1zmc4.jpg" style="width:100%;height:100%;border-radius:50%;object-fit:cover;">';
+    document.body.appendChild(fab);
+
+    const panel = document.createElement('div');
+    panel.className = 'main-menu-panel';
+    panel.style.display = 'none';
+    panel.innerHTML = '<div class="main-menu-header" id="panelHeader"><span class="main-menu-title">Control Panel</span><button class="main-menu-close" id="closePanelBtn">✕</button></div><div class="main-menu-content"></div>';
+    document.body.appendChild(panel);
+
+    fab.onclick = function() {
+        if (panel.style.display === 'none' || panel.style.display === '') {
+            panel.style.display = 'flex';
+            
+            checkAndSyncLoginStatus();
+            
+            const savedLogin = getStorage('isLoggedIn', 'false');
+            if (savedLogin === 'true') {
+                isLoggedIn = true;
+                currentUsername = getStorage('gameUsername', '');
+                updateMenuAfterLogin();
+            } else {
+                const pageUsername = getUsernameFromPage();
+                if (pageUsername) {
+                    doLogin(pageUsername);
+                    updateMenuAfterLogin();
+                } else {
+                    updateMenuNotLoggedIn();
+                }
+            }
+        } else {
+            panel.style.display = 'none';
+        }
+    };
+
+    document.getElementById('closePanelBtn').onclick = function() {
+        panel.style.display = 'none';
+    };
+
+    // Drag functionality
+    function makeDraggable(element, handle, onClickCallback) {
+        let isDragging = false;
+        let startX, startY, initialLeft, initialTop;
+        let dragStarted = false;
+
+        const onStart = function(clientX, clientY) {
+            isDragging = true;
+            dragStarted = false;
+            const rect = element.getBoundingClientRect();
+            startX = clientX;
+            startY = clientY;
+            initialLeft = rect.left;
+            initialTop = rect.top;
+            element.style.cursor = 'grabbing';
+            if (handle) handle.style.cursor = 'grabbing';
+        };
+
+        const onMove = function(clientX, clientY) {
+            if (!isDragging) return;
+            const dx = clientX - startX;
+            const dy = clientY - startY;
+            if (Math.abs(dx) > 5 || Math.abs(dy) > 5) dragStarted = true;
+            let newLeft = initialLeft + dx;
+            let newTop = initialTop + dy;
+            newLeft = Math.max(0, Math.min(window.innerWidth - element.offsetWidth, newLeft));
+            newTop = Math.max(0, Math.min(window.innerHeight - element.offsetHeight, newTop));
+            element.style.left = newLeft + 'px';
+            element.style.top = newTop + 'px';
+            element.style.right = 'auto';
+            element.style.bottom = 'auto';
+        };
+
+        const onEnd = function() {
+            if (isDragging) {
+                isDragging = false;
+                element.style.cursor = '';
+                if (handle) handle.style.cursor = '';
+                if (!dragStarted && onClickCallback) onClickCallback();
+                dragStarted = false;
+            }
+        };
+
+        handle.addEventListener('mousedown', function(e) {
+            e.preventDefault();
+            onStart(e.clientX, e.clientY);
+        });
+
+        document.addEventListener('mousemove', function(e) {
+            onMove(e.clientX, e.clientY);
+        });
+
+        document.addEventListener('mouseup', onEnd);
+
+        handle.addEventListener('touchstart', function(e) {
+            const touch = e.touches[0];
+            onStart(touch.clientX, touch.clientY);
+        });
+
+        document.addEventListener('touchmove', function(e) {
+            const touch = e.touches[0];
+            onMove(touch.clientX, touch.clientY);
+        });
+
+        document.addEventListener('touchend', onEnd);
+    }
+
+    makeDraggable(fab, fab);
+    makeDraggable(panel, document.getElementById('panelHeader'));
+
+    // ========== THEO DÕI SỰ THAY ĐỔI CỦA TRANG ==========
+    function startMonitoring() {
+        if (checkInterval) clearInterval(checkInterval);
+        checkInterval = setInterval(function() {
+            checkAndSyncLoginStatus();
+        }, 3000);
+        
+        const observer = new MutationObserver(function() {
+            checkAndSyncLoginStatus();
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
+    }
+
+    // ========== KHỞI ĐỘNG ==========
+    async function init() {
+        await loadKeys();
+        const savedKey = getStorage('userKey', '');
+        const savedDate = getStorage('keyDate', '');
+        const todayStr = getTodayString();
+        const todayKey = getTodayKey();
+        if (savedKey && savedDate === todayStr && savedKey === todayKey) {
+            isVIPActive = true;
+            updateVIPBadge();
+        }
+
+        const savedLogin = getStorage('isLoggedIn', 'false');
+        if (savedLogin === 'true') {
+            isLoggedIn = true;
+            currentUsername = getStorage('gameUsername', '');
+            console.log('[Init] Đã khôi phục đăng nhập cho:', currentUsername);
+        } else {
+            const pageUsername = getUsernameFromPage();
+            if (pageUsername) {
+                doLogin(pageUsername);
+            }
+        }
+        
+        startMonitoring();
+
+        console.log('%c🎯 Control Panel v5.0 - Đã thêm Jackpot (kéo thả + sửa thông báo)!', 'color: #0f0; font-size: 14px');
+        console.log('%c👆 Click vào nút tròn để mở menu', 'color: #ffd700;');
+        console.log('%c🎰 Mục Jackpot nằm trong VIP (không cần key)', 'color: #ff9800;');
+        console.log('%c💾 Trạng thái: ' + (isLoggedIn ? 'Đã đăng nhập (' + currentUsername + ')' : 'Chưa đăng nhập'), 'color: #4caf50;');
+    }
+
+    init();
+})();
